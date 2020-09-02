@@ -1,0 +1,414 @@
+#-------------------
+import copy
+from IIC_Models.utils import IIC_Time, Context_Block_Timing
+from IIC_Models.EDIServer.EDI_Transaction import EDI_Transaction_Group, Provider_Data
+from IIC_Models.Standard.Coding.IIC_ICD import IIC_ICD10_CM
+from IIC_Models.Standard.Coding.Medical_Procedure import Procedure_Code
+from IIC_Models.IIC.Medical_Practice import Medical_Practice # TODO: remove it
+from Payers.UHC.Config.business_data import Business_Data as bz_data
+
+from Payers.IIC.Payer_WebAPI import Payer_Call_Result_Error
+from IIC_Models.Standard.EDI import EDI_Defines as edi_def
+from copy import deepcopy
+
+
+
+class QNXTCIL_PA_Request:
+    '''
+    This class create the CIL PA request data .
+    '''
+    #--------------------------------------------------------------------------
+    def __init__(self, db_plugin, event_data, services_data):
+        self.db_plugin = db_plugin
+        self.edi_isa = db_plugin.request_edi
+        self.request_dt = db_plugin.request_dt
+        
+        
+    
+    um_default_service_code_type = "CPT"
+    um_default_icd_code_type = "ICD-10"
+    
+    QNXT_template_map = {}
+    
+    QNXT_template_map_no_facility_type = {
+            "HS_AF_NA": "OUTPAT001",
+            "HS_75_NA": "DME001",
+            "HS_40_NA": "OUTPAT001",
+            "HS_37_NA": "OUTPAT001",
+            "HS_18_NA": "DME001",
+            "HS_12_NA": "DME001",
+            "HS_1_NA": "OBS001",
+            "HS_PT_NA": "OUTPAT001",
+            "HS_AG_NA": "HHC001",
+            "HS_AF_NA": "OUTPAT001",
+            "HS_45_NA": "HHC001",
+            "HS_42_NA": "HHC001",
+            "HS_PT_NA": "OUTPAT001",
+            "HS_2_NA": "OUTPAT001", #TODO for facility: SDC001
+            "HS_74_NA": "HHC001"
+    }
+    
+    QNXT_template_map_no_service_type = {}
+    QNXT_default_template_id = '278'
+    
+    #--------------------------------------------------------------------------
+    @classmethod
+    def _get_template_id(cls, request_category_code, service_type_code, facility_code):
+
+        template_key = "%s_%s_%s"%(request_category_code,
+                                   service_type_code,
+                                   facility_code
+                                   )
+        templateId = cls.QNXT_template_map.get(template_key)
+        
+        #case: when there is no facility code
+        if templateId == None:
+            template_key = "%s_%s_%s"%(request_category_code,
+                                       service_type_code,
+                                       'NA'
+                                      )
+            templateId = cls.QNXT_template_map_no_facility_type.get(template_key)
+        
+        #case: when there is no service type
+        if templateId == None:
+            template_key = "%s_%s_%s"%(request_category_code,
+                                   'NA',
+                                   'NA'
+                                   )
+            templateId = cls.QNXT_template_map_no_service_type.get(template_key)
+        
+        if templateId == None:
+            templateId = cls.QNXT_default_template_id
+
+        return templateId
+
+
+    #--------------------------------------------------------------------------
+    
+    def get_facility_type_code_details(self):
+        """
+        this method will return the
+        facility type details
+        
+        Args: None
+        Return: Facility type
+        """
+        
+        fc_type = None
+        fc_code = self.db_plugin.request_info.facility_code
+        fc_type = edi_def.Facility_Type_Dict.get(fc_code, '')
+                
+        return fc_type
+
+    #--------------------------------------------------------------------------
+    def get_member_details(self):
+        """
+        this method will return
+        member information
+        """
+        #this will change once we get eligibilty
+        #API
+        member_dict = {}
+        member_id = self.db_plugin.iic_member_identifier.secondary_account_number
+        tenantenrolment_id = self.db_plugin.iic_member_identifier.member_id
+        
+        member_dict["tenantEnrollmentId"] = tenantenrolment_id
+        member_dict["memberId"] = member_id
+        member_dict["subscriberId"] = member_id 
+        
+        return member_dict
+
+
+
+
+    def get_cpt_codes_details(self):
+        """
+        this method will return
+        the procedure code list
+        
+        Args: None
+        Return: List of Procedure Codes
+        """
+        hcpcs_code = []
+        service_codes = self.db_plugin.request_info.service_codes
+        for cpt in service_codes:
+            hcpcs_code.append(cpt[1])
+        return hcpcs_code
+
+    #--------------------------------------------------------------------------
+
+    
+
+    def icd_codes_details(self):
+        """
+        this method will return
+        diagnostic codes dict
+        
+        Args: None
+        Return: diagnostic cides Dict
+        """
+        diagCode = {}
+        dia_li = []
+        diagnosis_codes = self.db_plugin.request_info.diagnosis_codes
+        for i, d in enumerate(diagnosis_codes, start=0):
+            if i == 0:
+                diagCode["primary"] = d
+            else:
+                dia_li.append(d)
+            diagCode["secondary"] = dia_li
+                
+        return diagCode
+
+
+
+
+
+
+    def get_secondary_icd_details(self):
+        """
+        this method will return the
+        secondary icd list
+        
+        Args: None
+        Return: secondary Icd list
+        """
+        secondary_icd = []
+        icds = self.icd_codes_details()
+        if icds.get("secondary"):
+            for icd in icds.get("secondary"):
+                secondary_icd.append({"diagnosisCode": icd})
+        else:
+            secondary_icd.append({"diagnosisCode": ""})
+        return secondary_icd
+
+    #--------------------------------------------------------------------------
+
+    def get_quantity_details(self):
+        """
+        this method will return
+        the quantity details
+        
+        Args: None
+        Return: Total Units
+        """
+        totalUnits = 0
+        no_of_services = len(self.db_plugin.request_info.service_list)
+        total_quantity = 0
+        quantity_len = len(self.db_plugin.request_info.service_quantitys)
+        for index in range(no_of_services):
+            service_quantitys = self.db_plugin.request_info.service_quantitys
+            if quantity_len >= index+1 and service_quantitys[index]:
+                service_quantity = service_quantitys[index]
+            else:
+                service_quantity = self.db_plugin.request_info.event_quantity
+        
+            totalUnits =  service_quantity[1]
+            
+        return totalUnits
+
+    #--------------------------------------------------------------------------
+
+    def get_event_dates_details(self):
+        """
+        this method will return
+        the event dates 
+        
+        Args: None
+        Return: startDate, endDate
+        """
+        
+        event_dates = self.db_plugin.request_info.event_dates
+        startDate = IIC_Time.format_to_str(event_dates[0], '%m/%d/%Y') #"08/19/2016"
+        #TODO : Move to db plugin
+        if self.db_plugin.request_info.service_type_code == '62':
+            endDate = event_dates[0]+IIC_Time.timedelta(days=90)
+        else:
+            endDate = event_dates[1]
+        endDate = IIC_Time.format_to_str(endDate, '%m/%d/%Y') #"08/22/2016"
+        
+        return startDate, endDate
+
+
+    #--------------------------------------------------------------------------
+
+    def get_requesting_provider_details(self):
+        """
+        this method will return the requesting
+        provider details
+        
+        Args: None
+        Return: Requesting provider dict
+        
+        """
+        rq_Prov = {}
+        request_provider = self.db_plugin.request_info.request_provider
+        referFromProvId = request_provider.provider_id if request_provider else ""
+        rq_Prov["providerId"] = referFromProvId
+        return rq_Prov
+        
+    #--------------------------------------------------------------------------
+
+
+    def get_svc_provider_details(self):
+        """
+        this method will return the 
+        service providers details
+        
+        Args: None
+        Return: Service Providers
+        """
+        
+        service_providers = self.db_plugin.request_info.service_providers
+        if service_providers and service_providers[0]:
+            service_providers = service_providers[0] # QNXT support only one service per request
+        else: 
+            service_providers = self.db_plugin.request_info.event_providers
+            
+        referToProvId = ""
+        referToLocation = ""
+        for prd in service_providers:
+            if not prd:
+                break
+            #TODO: Check with vivek how to send provider values
+            if prd.physician_type_code == '1':
+                referToProvId = prd.provider_id
+                referToLocation = prd.provider_id
+            else:
+                referToProvId = prd.provider_id
+        return referToLocation, referToProvId
+    #--------------------------------------------------------------------------
+    
+    def get_request_category_details(self):
+        """
+        this method will return the
+        request category HS or AR
+        
+        Args:None
+        Return: Requesting Category Type
+        """
+        request_ctg = None
+        rq_type  = self.db_plugin.request_info.request_category_code
+        if rq_type == "HS":
+            request_ctg = "OutPatient Authorization"
+            
+        elif rq_type == "AR":
+            request_ctg = "InPatient Authorization"
+            
+        else:
+            request_ctg = "Skilled Nursing Facility"
+
+        return request_ctg
+
+    #-------------------------------------------------------------------------
+
+
+    def create_primary_and_secondary_serviceLineDetails(self):
+        """
+        this method will return primary, secondary 
+        serviceline details 
+        
+        Args: None
+        Return: primary and Secondary serviceline
+        dict
+        """
+        create_dict = []
+        procedure_codes = self.get_cpt_codes_details()
+        svc = self.get_serviceLineDetails_details()
+        for cpt in procedure_codes:
+            svc_dict= deepcopy(svc)
+            svc_dict["procedureCode"] = cpt
+            create_dict.append(svc_dict)
+        
+        return create_dict
+
+    #--------------------------------------------------------------------------
+
+    def get_serviceLineDetails_details(self):
+        """
+        this method will return the serviceline
+        dict
+        
+        Args: None
+        Return: Serviceline Details Dict
+        """
+        service_lines_dict = {}
+        
+        service_lines_dict["placeOfService"]        = self.get_facility_type_code_details()
+        service_lines_dict["requestingProvider"]    = self.get_requesting_provider_details()   
+        service_lines_dict["renderingProvider"]     = {"providerId": svc_prov}  
+        service_lines_dict["servicingFacility"]     = {"providerId": svc_fc} 
+        service_lines_dict["serviceStartDate"]      = start_date
+        service_lines_dict["serviceEndDate"]        = end_date 
+
+        return service_lines_dict
+
+
+    #--------------------------------------------------------------------------
+
+
+    def get_confinementInformation_details(self):
+        """
+        this method will return confinementInformation
+        dict 
+        note: this will available for only Impatient(AR)
+        
+        Args: None
+        Return: dict of confinement info
+        """
+        confinement = {}
+        rq_type  = self.db_plugin.request_info.request_category_code
+        
+        if rq_type == "AR":
+            start_date, end_date = self.get_event_dates_details()
+            svc_fc, svc_prov = self.get_svc_provider_details()
+            icd = self.icd_codes_details()
+            primary = icd.get("primary")
+            data_time, delta = self.get_admission_date_time()
+            
+         
+            confinement["requestingProvider"]   = self.get_requesting_provider_details()   
+            confinement["renderingProvider"]    = {"providerId":svc_prov}   
+            confinement["servicingFacility"]    = {"providerId":svc_fc}
+            confinement["lengthOfStayInDays"]   = delta.day
+            confinement["placeOfService"]       = self.get_facility_type_code_details()
+           
+        else:
+            confinement = {}
+                
+        return confinement
+
+
+
+    #--------------------------------------------------------------------------
+
+
+
+
+    def update_um_request(self):
+        """
+        this method will return
+        request dict for Update UM
+        
+        Args: None
+        Return: Update UM Dict
+        
+        """
+        request_data = {}
+        request_data["authRefId"]               = ""
+        request_data["authRefStatus"]           = ""
+        request_data["authRefType"]             = self.get_request_category_details()
+    
+        request_data["memberDetails"]           = self.get_member_details()
+        request_data["templateId"]              = self._get_template_id()
+        request_data["confinementInformation"]  = self.get_confinementInformation_details()
+        request_data["secondaryDiagnosisCodes"] = self.get_secondary_icd_details()
+        request_data["event_Dates"]             = self.get_event_dates_details()
+        request_data["Quantity"]                = self.get_quantity_details()
+        request_data["serviceLineDetails"]      = self.create_primary_and_secondary_serviceLineDetails()
+        request_data["autoValidate"]            = "true"
+
+        confinement_details = request_data["confinementInformation"]
+        if not confinement_details:
+            request_data.pop("confinementInformation")
+        
+        return request_data
